@@ -1,362 +1,319 @@
 #!/bin/bash
-set -e
 set -u
 set -o pipefail
+
+LOG_TAG="user_project"
+BACKUP_DIR="/var/backups/user_homes"
 
 if [ "$EUID" -ne 0 ]; then
     echo "Script must run as root. Re-executing with sudo"
     exec sudo "$0" "$@"
 fi
 
-LOG_TAG="user_project"
-
-log_action() {
+log_action(){
     local message="$1"
     logger -t "$LOG_TAG" -p user.info "$message"
-    echo "$message"
+    echo ">> $message"
 }
 
-create_user() {
-    read -p "Enter your username: " username
+pause_prompt() {
+    read -p "Press Enter to continue..."
+}
+
+# Create a new user
+create_user(){
+    read -p "Enter new username: " username
 
     if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        echo -e "\nError: Invalid name format"
-        echo "Username must start with a lowercase letter and contain only a-z, 0-9, underscores, or hyphens"
-        read -p "Press Enter to continue"
+        echo "Error: Invalid username format."
+        pause_prompt
         return 1
     fi
 
     if id "$username" &>/dev/null; then
-        echo -e "\nError: User '$username' already exists"
-        read -p "Press Enter to continue"
+        echo "Error: User '$username' already exists."
+        pause_prompt
         return 1
     fi
 
     local error_msg
     if ! error_msg=$(useradd -m -s /bin/bash "$username" 2>&1); then
-        echo -e "\nError: Failed to create user"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
+        echo "Error: Failed to create user. Details: $error_msg"
+        pause_prompt
         return 1
     fi
 
-    log_action "Successfully created user: $username"
-    echo -e "\nNow set password"
+    log_action "Created user: $username"
 
+    echo "Set initial password:"
     if ! passwd "$username"; then
-        echo -e "\nWarning: Failed to set password"
-        echo "The account is created but locked"
-        log_action "Created user $username (password set FAILED)"
+        echo "Warning: Password setup failed."
+        log_action "Password set failed for $username"
     else
-        log_action "Successfully set password for $username"
+        log_action "Password set for $username"
     fi
 
-    read -p "Press Enter to continue"
-    return 0
+    pause_prompt
 }
 
-delete_user() {
+# Delete a user with optional backup
+delete_user(){
     read -p "Enter username to delete: " username
+
     if ! id "$username" &>/dev/null; then
-        echo -e "\nError: User '$username' doesn't exist"
-        read -p "Press Enter to continue"
+        echo "Error: User '$username' does not exist."
+        pause_prompt
         return 1
     fi
 
-    echo -e "\nWARNING: This will permanently delete the user '$username' and back up their home directory"
-    read -p "Are you absolutely sure? (y/n): " confirm
+    echo "WARNING: This will delete user '$username'"
+    read -p "Are you sure? (y/n): " confirm
     if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Deletion cancelled"
-        read -p "Press enter to continue"
+        echo "Operation cancelled"
+        pause_prompt
         return 1
     fi
 
-    local backup_dir="/var/backups/user_homes"
-    mkdir -p "$backup_dir"
-    local home_dir
+    mkdir -p "$BACKUP_DIR"
     home_dir=$(grep "^$username:" /etc/passwd | cut -d: -f6)
 
     if [ -d "$home_dir" ]; then
-        local backup_file="$backup_dir/$username-$(date +%F-%T).tar.gz"
-        echo "Backing up $home_dir to $backup_file"
-        if ! tar -czf "$backup_file" -C / "${home_dir#/}" 2>&1; then
-            echo "\nWarning: Couldn't back up home dir, not deleting user"
-            read -p "Press Enter to continue"
-            return 1
+        backup_file="$BACKUP_DIR/$username-$(date +%F-%T).tar.gz"
+        echo "Backing up home directory to $backup_file"
+        if tar -czf "$backup_file" -C / "${home_dir#/}" 2>/dev/null; then
+            log_action "Backed up $home_dir to $backup_file"
+        else
+            echo "Warning: Backup failed."
         fi
-        log_action "Backed up $home_dir to $backup_file"
+    fi
+
+    if userdel -r "$username" 2>/dev/null; then
+        log_action "Deleted user '$username'"
     else
-        echo "No home dir found at $home_dir, skipping backup"
+        echo "Error: Failed to delete user"
     fi
 
-    local error_msg
-    if ! error_msg=$(userdel -r "$username" 2>&1); then
-        echo -e "\nError: Failed to delete user"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
+    pause_prompt
+}
+
+# Modify password, shell, or name
+modify_user() {
+    read -p "Enter username to modify: " username
+
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist"
+        pause_prompt
         return 1
     fi
 
-    log_action "Successfully deleted user '$username' and their home dir"
-    read -p "Press Enter to continue"
-    return 0
+    echo "--- Modify User: $username ---"
+    echo "1) Change Password"
+    echo "2) Change Shell"
+    echo "3) Change Full Name"
+    echo "4) Cancel"
+    read -p "Select option: " mod_choice
+
+    case "$mod_choice" in
+        1)
+            passwd "$username"
+            log_action "Password modified for $username"
+            ;;
+        2)
+            read -p "Enter new shell: " new_shell
+            if [ -x "$new_shell" ]; then
+                usermod -s "$new_shell" "$username"
+                log_action "Shell changed for $username"
+            else
+                echo "Error: Invalid shell"
+            fi
+            ;;
+        3)
+            read -p "Enter new full name: " new_name
+            usermod -c "$new_name" "$username"
+            log_action "Name changed for $username"
+            ;;
+        4) return 0 ;;
+        *) echo "Invalid option" ;;
+    esac
+    pause_prompt
 }
 
-lock_user() {
+# List regular users
+list_users() {
+    echo "== System Users =="
+    printf "%-15s | %-6s | %-20s | %-15s\n" "Username" "UID" "Home Directory" "Shell"
+    echo "------------------------------------------------------------------"
+
+    awk -F: '$3 >= 1000 && $1 != "nobody" {printf "%-15s | %-6s | %-20s | %-15s\n", $1, $3, $6, $7}' /etc/passwd
+
+    echo "------------------------------------------------------------------"
+    pause_prompt
+}
+
+# Lock user account
+lock_user(){
     read -p "Username to lock: " username
-    if ! id "$username" &>/dev/null; then
-        echo -e "\nError: User '$username' doesn't exist"
-        read -p "Press Enter to continue"
-        return 1
+    if usermod -L "$username" 2>/dev/null; then
+        log_action "Locked: $username"
+    else
+        echo "Error locking user."
     fi
-
-    local error_msg
-    if ! error_msg=$(usermod -L "$username" 2>&1); then
-        echo -e "\nError: Failed to lock account"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    log_action "Successfully locked account for user '$username'"
-    echo "Account for '$username' is now locked."
-    return 0
+    pause_prompt
 }
 
-unlock_user() {
-    read -p "Enter username to unlock: " username
-    if ! id "$username" &>/dev/null; then
-        echo -e "\nError: User '$username' doesn't exist"
-        read -p "Press Enter to continue"
-        return 1
+# Unlock user account
+unlock_user(){
+    read -p "Username to unlock: " username
+    if usermod -U "$username" 2>/dev/null; then
+        log_action "Unlocked: $username"
+    else
+        echo "Error unlocking user"
     fi
-
-    local error_msg
-    if ! error_msg=$(usermod -U "$username" 2>&1); then
-        echo -e "\nError: Failed to unlock account"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    log_action "Successfully unlocked account for user '$username'"
-    echo "Account for '$username' is now unlocked"
-    read -p "Press Enter to continue"
-    return 0
+    pause_prompt
 }
 
-create_group() {
+# Create group
+create_group(){
     read -p "Enter new group name: " groupname
-    if ! [[ "$groupname" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        echo -e "\nError: Invalid group name format"
-        read -p "Press Enter to continue"
-        return 1
+    if groupadd "$groupname" 2>/dev/null; then
+        log_action "Created group: $groupname"
+    else
+        echo "Error creating group"
     fi
-
-    if getent group "$groupname" &>/dev/null; then
-        echo -e "\nError: Group '$groupname' already exists"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    local error_msg
-    if ! error_msg=$(groupadd "$groupname" 2>&1); then
-        echo -e "\nError: Failed to create group"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    log_action "Successfully created group: $groupname"
-    echo "Group '$groupname' created"
-    read -p "Press Enter to continue"
-    return 0
+    pause_prompt
 }
 
-delete_group() {
-    read -p "Enter your group name to delete: " groupname
-    if ! getent group "$groupname" &>/dev/null; then
-        echo -e "\nError: Group '$groupname' doesn't exist"
-        read -p "Press Enter to continue"
-        return 1
+# Delete group
+delete_group(){
+    read -p "Enter group to delete: " groupname
+    if groupdel "$groupname" 2>/dev/null; then
+        log_action "Deleted group: $groupname"
+    else
+        echo "Error deleting group"
     fi
-
-    read -p "Sure you want to delete the group '$groupname'? (y/n): " confirm
-    if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Deletion cancelled"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    local error_msg
-    if ! error_msg=$(groupdel "$groupname" 2>&1); then
-        echo -e "\nError: Failed to delete group"
-        echo "Details: $error_msg"
-        echo "You often can't delete a group if it's the primary group for any user"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    log_action "Successfully deleted group: $groupname"
-    echo "Group '$groupname' deleted"
-    read -p "Press Enter to continue"
-    return 0
+    pause_prompt
 }
 
+# Add user to group
 add_user_group() {
     read -p "Enter username: " username
-    if ! id "$username" &>/dev/null; then
-        echo -e "\nError: User '$username' doesn't exist"
-        read -p "Press Enter to continue"
-        return 1
-    fi
+    read -p "Enter group name: " groupname
 
-    read -p "Enter group name to add user to: " groupname
-    if ! getent group "$groupname" &>/dev/null; then
-        echo -e "\nError: Group '$groupname' doesn't exist"
-        read -p "Press Enter to continue"
-        return 1
+    if usermod -aG "$groupname" "$username" 2>/dev/null; then
+        log_action "Added $username to $groupname"
+    else
+        echo "Error adding user to group"
     fi
-
-    local error_msg
-    if ! error_msg=$(usermod -aG "$groupname" "$username" 2>&1); then
-        echo -e "\nError: Failed to add user to group"
-        echo "Details: $error_msg"
-        read -p "Press Enter to continue"
-        return 1
-    fi
-
-    log_action "Successfully added user '$username' to group '$groupname'"
-    echo "User '$username' added to group '$groupname'"
-    return 0
+    pause_prompt
 }
 
-batch_process() {
-    local input_file=""
-    TEMP=$(getopt -o f: --long file: -n 'manage.sh' -- "$@")
-    if [ $? -ne 0 ]; then
-        echo "Error: Invalid argument" >&2
-        exit 1
-    fi
-    eval set -- "$TEMP"
-
-    while true; do
-        case "$1" in
-            -f | --file)
-                input_file="$2"
-                shift 2
-                ;;
-            --)
-                shift
-                break
-                ;;
-            *)
-                echo "Internal error"
-                exit 1
-                ;;
-        esac
-    done
-
-    if [ -z "$input_file" ]; then
-        echo "Error: --file <filename> is required for batch mode"
-        return 1
-    fi
-
-    if [ ! -r "$input_file" ]; then
-        echo "Error: File '$input_file' not found or not readable"
-        return 1
-    fi
-
-    process_user_file "$input_file"
-}
-
+# Batch process CSV user creation
 process_user_file() {
     local input_file="$1"
     local line_num=0
 
+    echo "Starting batch process from $input_file"
+
     while IFS= read -r line; do
         line_num=$((line_num + 1))
-        if [[ -z "$line" || "$line" == \#* ]]; then
-            continue
-        fi
+        [[ -z "$line" || "$line" == \#* ]] && continue
 
         IFS=',' read -r username rest <<< "$line"
         IFS=',' read -ra group_array <<< "$rest"
 
         if [ -z "$username" ]; then
-            echo "Skipping line $line_num: No username found"
+            echo "Line $line_num: Missing username"
             continue
         fi
 
-        echo "Processing $username"
-
-        if id "$username" &>/dev/null; then
-            echo "User '$username' already exists, skipping"
-        else
+        if ! id "$username" &>/dev/null; then
             if useradd -m -s /bin/bash "$username"; then
-                log_action "Created user: $username"
+                log_action "Batch created: $username"
                 passwd -l "$username" &>/dev/null
-                log_action "Locked password for $username"
             else
-                echo "Error creating $username, skipping"
+                echo "Error creating $username."
                 continue
             fi
         fi
 
         for group in "${group_array[@]}"; do
-            if [ -n "$group" ]; then
-                if ! getent group "$group" &>/dev/null; then
-                    echo "Group '$group' not found, creating"
-                    groupadd "$group"
-                    log_action "Created group: $group"
-                fi
-                usermod -aG "$group" "$username" &>/dev/null
-                log_action "Added user '$username' to group '$group'"
+            group=$(echo "$group" | xargs)
+            [ -z "$group" ] && continue
+
+            if ! getent group "$group" &>/dev/null; then
+                groupadd "$group"
+                log_action "Batch created group: $group"
             fi
+
+            usermod -aG "$group" "$username"
+            echo "  - Added to $group"
         done
+
     done < "$input_file"
-    echo "Batch processing complete"
+
+    log_action "Batch complete"
 }
 
-main_menu() {
+batch_process(){
+    local input_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--file)
+                input_file="$2"
+                shift; shift ;;
+            *)
+                echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [ -z "$input_file" ] || [ ! -r "$input_file" ]; then
+        echo "Error: Valid --file required"
+        exit 1
+    fi
+
+    process_user_file "$input_file"
+}
+
+main_menu(){
     while true; do
         clear
-        echo "==== User Functions ===="
+        echo "=========================================="
+        echo "   User & Group Management System"
+        echo "=========================================="
         echo "1) Create User"
         echo "2) Delete User"
-        echo "3) Lock User Account"
-        echo "4) Unlock User Account"
-        echo "==== Group Functions ===="
-        echo "5) Create Group"
-        echo "6) Delete Group"
-        echo "7) Add User to Group"
-        echo "9) Exit"
+        echo "3) Modify User"
+        echo "4) List Users"
+        echo "5) Lock User"
+        echo "6) Unlock User"
+        echo "7) Create Group"
+        echo "8) Delete Group"
+        echo "9) Add User to Group"
+        echo "0) Exit"
+        echo "=========================================="
+        read -p "Enter choice: " choice
 
-        read -p "Enter your choice: " choice
         case "$choice" in
             1) create_user ;;
             2) delete_user ;;
-            3) lock_user ;;
-            4) unlock_user ;;
-            5) create_group ;;
-            6) delete_group ;;
-            7) add_user_group ;;
-            9)
-                log_action "Exiting"
-                echo "Bye bye"
-                break
-                ;;
-            *) echo "Invalid option, try again"; read -p "Press enter to continue" ;;
+            3) modify_user ;;
+            4) list_users ;;
+            5) lock_user ;;
+            6) unlock_user ;;
+            7) create_group ;;
+            8) delete_group ;;
+            9) add_user_group ;;
+            0) log_action "Exit"; exit 0 ;;
+            *) echo "Invalid option"; pause_prompt ;;
         esac
     done
 }
 
-log_action "User management script started"
+log_action "Script started"
 
-if [ $# -eq 0 ]; then
-    log_action "Started in interactive mode"
-    main_menu
-else
-    log_action "Started in batch mode"
+if [ $# -gt 0 ]; then
     batch_process "$@"
+else
+    main_menu
 fi
