@@ -4,6 +4,7 @@ set -o pipefail
 
 LOG_TAG="user_project"
 BACKUP_DIR="/var/backups/user_homes"
+USER_REGEX='^[a-z_][a-z0-9_-]{0,31}$'
 
 if [ "$EUID" -ne 0 ]; then
     echo "Script must run as root. Re-executing with sudo"
@@ -12,7 +13,8 @@ fi
 
 log_action(){
     local message="$1"
-    logger -t "$LOG_TAG" -p user.info "$message"
+   
+    logger -t "$LOG_TAG" -p user.info "$message" 2>/dev/null
     echo ">> $message"
 }
 
@@ -20,12 +22,24 @@ pause_prompt() {
     read -p "Press Enter to continue..."
 }
 
-# Create a new user
+validate_groupname() {
+    local groupname="$1"
+    if [ ${#groupname} -lt 1 ] || [ ${#groupname} -gt 32 ]; then
+        return 1
+    fi
+
+    if ! [[ "$groupname" =~ $USER_REGEX ]]; then
+        return 1
+    fi
+    return 0
+}
+
 create_user(){
     read -p "Enter new username: " username
+    username=$(echo "$username" | xargs)
 
-    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        echo "Error: Invalid username format."
+    if ! [[ "$username" =~ $USER_REGEX ]]; then
+        echo "Error: Invalid username format (must start with letter/_, max 32 chars)."
         pause_prompt
         return 1
     fi
@@ -56,9 +70,9 @@ create_user(){
     pause_prompt
 }
 
-# Delete a user with optional backup
 delete_user(){
     read -p "Enter username to delete: " username
+    username=$(echo "$username" | xargs)
 
     if ! id "$username" &>/dev/null; then
         echo "Error: User '$username' does not exist."
@@ -74,31 +88,50 @@ delete_user(){
         return 1
     fi
 
-    mkdir -p "$BACKUP_DIR"
-    home_dir=$(grep "^$username:" /etc/passwd | cut -d: -f6)
-
-    if [ -d "$home_dir" ]; then
-        backup_file="$BACKUP_DIR/$username-$(date +%F-%T).tar.gz"
-        echo "Backing up home directory to $backup_file"
-        if tar -czf "$backup_file" -C / "${home_dir#/}" 2>/dev/null; then
-            log_action "Backed up $home_dir to $backup_file"
-        else
-            echo "Warning: Backup failed."
+    if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
+        echo "Warning: Could not create backup directory."
+        read -p "Continue without backup? (y/n): " continue_no_backup
+        if ! [[ "$continue_no_backup" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            pause_prompt
+            return 1
         fi
     fi
 
-    if userdel -r "$username" 2>/dev/null; then
+    local home_dir
+    home_dir=$(getent passwd "$username" | cut -d: -f6)
+
+    if [ -d "$home_dir" ]; then
+        local backup_file="$BACKUP_DIR/$username-$(date +%F-%T).tar.gz"
+        echo "Backing up home directory to $backup_file"
+        
+        local backup_error
+        if backup_error=$(tar -czf "$backup_file" -C / "${home_dir#/}" 2>&1); then
+            log_action "Backed up $home_dir to $backup_file"
+        else
+            echo "Warning: Backup failed. Details: $backup_error"
+            read -p "Continue anyway? (y/n): " continue_anyway
+            if ! [[ "$continue_anyway" =~ ^[Yy]$ ]]; then
+                echo "Operation cancelled."
+                pause_prompt
+                return 1
+            fi
+        fi
+    fi
+
+    local del_error
+    if del_error=$(userdel -r "$username" 2>&1); then
         log_action "Deleted user '$username'"
     else
-        echo "Error: Failed to delete user"
+        echo "Error: Failed to delete user. Details: $del_error"
     fi
 
     pause_prompt
 }
 
-# Modify password, shell, or name
 modify_user() {
     read -p "Enter username to modify: " username
+    username=$(echo "$username" | xargs)
 
     if ! id "$username" &>/dev/null; then
         echo "Error: User '$username' does not exist"
@@ -115,16 +148,21 @@ modify_user() {
 
     case "$mod_choice" in
         1)
-            passwd "$username"
-            log_action "Password modified for $username"
+            if passwd "$username"; then
+                log_action "Password modified for $username"
+            else
+                echo "Error: Password change failed."
+            fi
             ;;
         2)
             read -p "Enter new shell: " new_shell
-            if [ -x "$new_shell" ]; then
+            new_shell=$(echo "$new_shell" | xargs)
+            # FIX: Check against /etc/shells for security
+            if [ -f "$new_shell" ] && [ -x "$new_shell" ] && grep -qx "$new_shell" /etc/shells 2>/dev/null; then
                 usermod -s "$new_shell" "$username"
                 log_action "Shell changed for $username"
             else
-                echo "Error: Invalid shell"
+                echo "Error: Invalid shell (must be executable and listed in /etc/shells)"
             fi
             ;;
         3)
@@ -138,76 +176,154 @@ modify_user() {
     pause_prompt
 }
 
-# List regular users
 list_users() {
     echo "== System Users =="
     printf "%-15s | %-6s | %-20s | %-15s\n" "Username" "UID" "Home Directory" "Shell"
     echo "------------------------------------------------------------------"
 
-    awk -F: '$3 >= 1000 && $1 != "nobody" {printf "%-15s | %-6s | %-20s | %-15s\n", $1, $3, $6, $7}' /etc/passwd
-
+    getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" {printf "%-15s | %-6s | %-20s | %-15s\n", $1, $3, $6, $7}' | sort
+    
     echo "------------------------------------------------------------------"
     pause_prompt
 }
 
-# Lock user account
 lock_user(){
     read -p "Username to lock: " username
-    if usermod -L "$username" 2>/dev/null; then
+    username=$(echo "$username" | xargs)
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist."
+        pause_prompt
+        return 1
+    fi
+
+    if passwd -S "$username" 2>/dev/null | grep -q " L "; then
+        echo "Warning: User already locked."
+        pause_prompt
+        return 0
+    fi
+
+    local lock_error
+    if lock_error=$(usermod -L "$username" 2>&1); then
         log_action "Locked: $username"
     else
-        echo "Error locking user."
+        echo "Error locking user. Details: $lock_error"
     fi
     pause_prompt
 }
 
-# Unlock user account
 unlock_user(){
     read -p "Username to unlock: " username
-    if usermod -U "$username" 2>/dev/null; then
+    username=$(echo "$username" | xargs)
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist."
+        pause_prompt
+        return 1
+    fi
+
+    if passwd -S "$username" 2>/dev/null | grep -q " P "; then
+        echo "Warning: User already unlocked."
+        pause_prompt
+        return 0
+    fi
+
+    local unlock_error
+    if unlock_error=$(usermod -U "$username" 2>&1); then
         log_action "Unlocked: $username"
     else
-        echo "Error unlocking user"
+        echo "Error unlocking user. Details: $unlock_error"
     fi
     pause_prompt
 }
 
-# Create group
 create_group(){
     read -p "Enter new group name: " groupname
-    if groupadd "$groupname" 2>/dev/null; then
+    groupname=$(echo "$groupname" | xargs)
+
+    if ! validate_groupname "$groupname"; then
+        echo "Error: Invalid group name."
+        pause_prompt
+        return 1
+    fi
+
+    if getent group "$groupname" &>/dev/null; then
+        echo "Error: Group already exists."
+        pause_prompt
+        return 1
+    fi
+
+    local grp_error
+    if grp_error=$(groupadd "$groupname" 2>&1); then
         log_action "Created group: $groupname"
     else
-        echo "Error creating group"
+        echo "Error creating group. Details: $grp_error"
     fi
     pause_prompt
 }
 
-# Delete group
 delete_group(){
     read -p "Enter group to delete: " groupname
-    if groupdel "$groupname" 2>/dev/null; then
+    groupname=$(echo "$groupname" | xargs)
+
+    if ! getent group "$groupname" &>/dev/null; then
+        echo "Error: Group does not exist."
+        pause_prompt
+        return 1
+    fi
+
+    local users_with_group
+    users_with_group=$(getent passwd | awk -F: -v gid="$(getent group "$groupname" | cut -d: -f3)" '$4 == gid {print $1}')
+    
+    if [ -n "$users_with_group" ]; then
+        echo "Warning: Primary group for users: $users_with_group"
+        read -p "Continue? (y/n): " confirm
+        if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            pause_prompt
+            return 0
+        fi
+    fi
+
+    local cmd_output
+    if cmd_output=$(groupdel "$groupname" 2>&1); then
         log_action "Deleted group: $groupname"
     else
-        echo "Error deleting group"
+        echo "Error deleting group. Details: $cmd_output"
     fi
     pause_prompt
 }
 
-# Add user to group
 add_user_group() {
     read -p "Enter username: " username
+    username=$(echo "$username" | xargs)
     read -p "Enter group name: " groupname
+    groupname=$(echo "$groupname" | xargs)
 
-    if usermod -aG "$groupname" "$username" 2>/dev/null; then
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User does not exist."
+        pause_prompt
+        return 1
+    fi
+    if ! getent group "$groupname" &>/dev/null; then
+        echo "Error: Group does not exist."
+        pause_prompt
+        return 1
+    fi
+
+    if groups "$username" 2>/dev/null | grep -qw "$groupname"; then
+        echo "Warning: User already in group."
+        pause_prompt
+        return 0
+    fi
+
+    local add_error
+    if add_error=$(usermod -aG "$groupname" "$username" 2>&1); then
         log_action "Added $username to $groupname"
     else
-        echo "Error adding user to group"
+        echo "Error adding user to group. Details: $add_error"
     fi
     pause_prompt
 }
 
-# Batch process CSV user creation
 process_user_file() {
     local input_file="$1"
     local line_num=0
@@ -219,6 +335,7 @@ process_user_file() {
         [[ -z "$line" || "$line" == \#* ]] && continue
 
         IFS=',' read -r username rest <<< "$line"
+        username=$(echo "$username" | xargs)
         IFS=',' read -ra group_array <<< "$rest"
 
         if [ -z "$username" ]; then
@@ -226,12 +343,18 @@ process_user_file() {
             continue
         fi
 
+        if ! [[ "$username" =~ $USER_REGEX ]]; then
+            echo "Line $line_num: Invalid username format"
+            continue
+        fi
+
         if ! id "$username" &>/dev/null; then
-            if useradd -m -s /bin/bash "$username"; then
+            local create_error
+            if create_error=$(useradd -m -s /bin/bash "$username" 2>&1); then
                 log_action "Batch created: $username"
                 passwd -l "$username" &>/dev/null
             else
-                echo "Error creating $username."
+                echo "Line $line_num: Error creating $username. Details: $create_error"
                 continue
             fi
         fi
@@ -240,13 +363,27 @@ process_user_file() {
             group=$(echo "$group" | xargs)
             [ -z "$group" ] && continue
 
-            if ! getent group "$group" &>/dev/null; then
-                groupadd "$group"
-                log_action "Batch created group: $group"
+            if ! validate_groupname "$group"; then
+                echo "Line $line_num: Invalid group $group"
+                continue
             fi
 
-            usermod -aG "$group" "$username"
-            echo "  - Added to $group"
+            if ! getent group "$group" &>/dev/null; then
+                local grp_create_error
+                if grp_create_error=$(groupadd "$group" 2>&1); then
+                    log_action "Batch created group: $group"
+                else
+                    echo "Line $line_num: Error creating group $group. Details: $grp_create_error"
+                    continue
+                fi
+            fi
+
+            local add_grp_error
+            if add_grp_error=$(usermod -aG "$group" "$username" 2>&1); then
+                echo " - Added to $group"
+            else
+                echo "Line $line_num: Error adding to $group. Details: $add_grp_error"
+            fi
         done
 
     done < "$input_file"
@@ -260,8 +397,13 @@ batch_process(){
     while [[ $# -gt 0 ]]; do
         case $1 in
             -f|--file)
+                if [ -z "${2:-}" ]; then 
+                    echo "Error: Option '$1' requires a file argument."
+                    exit 1
+                fi
                 input_file="$2"
-                shift; shift ;;
+                shift 2 
+                ;;
             *)
                 echo "Unknown option: $1"; exit 1 ;;
         esac
@@ -279,7 +421,7 @@ main_menu(){
     while true; do
         clear
         echo "=========================================="
-        echo "   User & Group Management System"
+        echo " User & Group Management System"
         echo "=========================================="
         echo "1) Create User"
         echo "2) Delete User"
